@@ -1,162 +1,119 @@
 import asyncio
-import json
 import logging
-from typing import Dict, List, Optional, Any, Tuple, Callable
-
-# Keep your MCPClient implementation unchanged
-import asyncio
+from typing import Optional, List, Callable, Dict, Any, Union, Tuple
 from contextlib import AsyncExitStack
-
-# MCP core imports
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-
-# Set up logging
-logger = logging.getLogger(__name__)
+from tinyagent.mcp_client import StdioServerParameters, stdio_client, ClientSession
 
 class MCPClient:
-    def __init__(self, logger: Optional[logging.Logger] = None):
-        self.session = None
+    """
+    Async MCPClient that can manage one or multiple MCP server connections.
+    Supports callbacks on tool events and async context management.
+    """
+    def __init__(self,
+                 server_parameters: Union[
+                     dict, Tuple[str, List[str]], List[Union[dict, Tuple[str, List[str]]]]
+                 ],
+                 logger: Optional[logging.Logger] = None):
+        # Normalize server parameters into a list of dicts
+        if not isinstance(server_parameters, list):
+            server_parameters = [server_parameters]
+        params_list: List[dict] = []
+        for p in server_parameters:
+            if isinstance(p, tuple):
+                cmd, args = p
+                params_list.append({"command": cmd, "args": args})
+            elif isinstance(p, dict):
+                params_list.append(p)
+            else:
+                raise ValueError(f"Invalid server parameter type: {type(p)}")
+        self._server_params = params_list
         self.exit_stack = AsyncExitStack()
         self.logger = logger or logging.getLogger(__name__)
-        
-        # Simplified callback system
-        self.callbacks: List[callable] = []
-        
-        self.logger.debug("MCPClient initialized")
+        self.callbacks: List[Callable] = []
+        self.sessions: List[ClientSession] = []
+        self.tool_map: Dict[str, ClientSession] = {}
+        self.logger.debug("MCPClient initialized with %d server(s)", len(self._server_params))
 
-    def add_callback(self, callback: callable) -> None:
-        """
-        Add a callback function to the client.
-        
-        Args:
-            callback: A function that accepts (event_name, client, **kwargs)
-        """
-        self.callbacks.append(callback)
-    
-    async def _run_callbacks(self, event_name: str, **kwargs) -> None:
-        """
-        Run all registered callbacks for an event.
-        
-        Args:
-            event_name: The name of the event
-            **kwargs: Additional data for the event
-        """
-        for callback in self.callbacks:
-            try:
-                logger.debug(f"Running callback: {callback}")
-                if asyncio.iscoroutinefunction(callback):
-                    logger.debug(f"Callback is a coroutine function")
-                    await callback(event_name, self, **kwargs)
-                else:
-                    # Check if the callback is a class with an async __call__ method
-                    if hasattr(callback, '__call__') and asyncio.iscoroutinefunction(callback.__call__):
-                        logger.debug(f"Callback is a class with an async __call__ method")  
-                        await callback(event_name, self, **kwargs)
-                    else:
-                        logger.debug(f"Callback is a regular function")
-                        callback(event_name, self, **kwargs)
-            except Exception as e:
-                logger.error(f"Error in callback for {event_name}: {str(e)}")
+    async def __aenter__(self):
+        await self.connect()
+        return self
 
-    async def connect(self, command: str, args: list[str]):
-        """
-        Launches the MCP server subprocess and initializes the client session.
-        :param command: e.g. "python" or "node"
-        :param args: list of args to pass, e.g. ["my_server.py"] or ["build/index.js"]
-        """
-        # Prepare stdio transport parameters
-        params = StdioServerParameters(command=command, args=args)
-        # Open the stdio client transport
-        self.stdio, self.sock_write = await self.exit_stack.enter_async_context(
-            stdio_client(params)
-        )
-        # Create and initialize the MCP client session
-        self.session = await self.exit_stack.enter_async_context(
-            ClientSession(self.stdio, self.sock_write)
-        )
-        await self.session.initialize()
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
 
-    async def list_tools(self):
-        resp = await self.session.list_tools()
-        print("Available tools:")
-        for tool in resp.tools:
-            print(f" • {tool.name}: {tool.description}")
+    async def connect(self) -> None:
+        """
+        Connect to all configured MCP servers and initialize sessions.
+        Builds internal tool-to-session map.
+        """
+        # Start each MCP server session
+        for params in self._server_params:
+            sp = StdioServerParameters(**params)
+            stdio, sock_write = await self.exit_stack.enter_async_context(
+                stdio_client(sp)
+            )
+            session = await self.exit_stack.enter_async_context(
+                ClientSession(stdio, sock_write)
+            )
+            await session.initialize()
+            self.sessions.append(session)
+        # Build tool map for dispatching
+        await self._build_tool_map()
 
-    async def call_tool(self, name: str, arguments: dict):
+    async def _build_tool_map(self):
+        self.tool_map = {}
+        for session in self.sessions:
+            resp = await session.list_tools()
+            for tool in resp.tools:
+                self.tool_map[tool.name] = session
+
+    async def list_tools(self) -> List:
         """
-        Invokes a named tool and returns its raw content list.
+        List all available tools across all MCP sessions.
         """
-        # Notify tool start
+        all_tools = []
+        for session in self.sessions:
+            resp = await session.list_tools()
+            for tool in resp.tools:
+                all_tools.append(tool)
+        return all_tools
+
+    async def call_tool(self, name: str, arguments: dict) -> Any:
+        """
+        Call a named tool on the appropriate MCP session.
+        """
         await self._run_callbacks("tool_start", tool_name=name, arguments=arguments)
-        
+        session = self.tool_map.get(name)
+        if session is None:
+            err = f"No MCP session registered for tool '{name}'"
+            await self._run_callbacks("tool_end", tool_name=name,
+                                      arguments=arguments, error=err, success=False)
+            raise ValueError(err)
         try:
-            resp = await self.session.call_tool(name, arguments)
-            
-            # Notify tool end
-            await self._run_callbacks("tool_end", tool_name=name, arguments=arguments, 
-                                    result=resp.content, success=True)
-            
-            return resp.content
+            resp = await session.call_tool(name, arguments)
+            result = resp.content
+            await self._run_callbacks("tool_end", tool_name=name,
+                                      arguments=arguments, result=result, success=True)
+            return result
         except Exception as e:
-            # Notify tool end with error
-            await self._run_callbacks("tool_end", tool_name=name, arguments=arguments, 
-                                    error=str(e), success=False)
+            await self._run_callbacks("tool_end", tool_name=name,
+                                      arguments=arguments, error=str(e), success=False)
             raise
 
-    async def close(self):
-        """Clean up subprocess and streams."""
-        if self.exit_stack:
-            try:
-                await self.exit_stack.aclose()
-            except (RuntimeError, asyncio.CancelledError) as e:
-                # Log the error but don't re-raise it
-                self.logger.error(f"Error during client cleanup: {e}")
-            finally:
-                # Always reset these regardless of success or failure
-                self.session = None
-                self.exit_stack = AsyncExitStack()
+    def register_callback(self, callback: Callable):
+        self.callbacks.append(callback)
 
-async def run_example():
-    """Example usage of MCPClient with proper logging."""
-    import sys
-    from tinyagent.hooks.logging_manager import LoggingManager
-    
-    # Create and configure logging manager
-    log_manager = LoggingManager(default_level=logging.INFO)
-    log_manager.set_levels({
-        'tinyagent.mcp_client': logging.DEBUG,  # Debug for this module
-        'tinyagent.tiny_agent': logging.INFO,
-    })
-    
-    # Configure a console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    log_manager.configure_handler(
-        console_handler,
-        format_string='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        level=logging.DEBUG
-    )
-    
-    # Get module-specific logger
-    mcp_logger = log_manager.get_logger('tinyagent.mcp_client')
-    
-    mcp_logger.debug("Starting MCPClient example")
-    
-    # Create client with our logger
-    client = MCPClient(logger=mcp_logger)
-    
-    try:
-        # Connect to a simple echo server
-        await client.connect("python", ["-m", "mcp.examples.echo_server"])
-        
-        # List available tools
-        await client.list_tools()
-        
-        # Call the echo tool
-        result = await client.call_tool("echo", {"message": "Hello, MCP!"})
-        mcp_logger.info(f"Echo result: {result}")
-        
-    finally:
-        # Clean up
-        await client.close()
-        mcp_logger.debug("Example completed")
+    async def _run_callbacks(self, event: str, **kwargs):
+        for cb in self.callbacks:
+            await cb(event, **kwargs)
+
+    async def close(self):
+        # Close all sessions and cleanup
+        try:
+            await self.exit_stack.aclose()
+        except (RuntimeError, asyncio.CancelledError) as e:
+            self.logger.error(f"Error during client cleanup: {e}")
+        finally:
+            self.sessions = []
+            self.tool_map = {}
+            self.exit_stack = AsyncExitStack()
